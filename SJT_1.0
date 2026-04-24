@@ -1,0 +1,231 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import time
+import csv
+from enum import Enum, auto
+
+# --- CONFIGURATION & COLORS ---
+class State(Enum):
+    IDLE = auto()
+    LOADING = auto()
+    RUNNING = auto()
+    UNLOADING = auto()
+
+COLORS = {
+    State.IDLE: "#2c3e50",
+    State.LOADING: "#d35400",
+    State.RUNNING: "#27ae60",
+    State.UNLOADING: "#2980b9",
+    "PAUSED": "#f1c40f"
+}
+
+# --- 1. THE LOGIC ENGINE ---
+class BatchEngine:
+    def __init__(self):
+        self.state = State.IDLE
+        self.batch_id = 1
+        self.is_paused = False
+        self.start_time = 0 
+        self.elapsed_at_pause = 0
+        self.history = {"LOADING": 0, "RUNNING": 0, "UNLOADING": 0}
+        self.grand_total_time = 0.0
+
+    def get_elapsed(self):
+        if self.state == State.IDLE: return 0.0
+        if self.is_paused: return self.elapsed_at_pause
+        # Use monotonic for hardware-level timing
+        return self.elapsed_at_pause + (time.monotonic() - self.start_time)
+
+    def toggle_pause(self):
+        if self.state == State.IDLE: return
+        if not self.is_paused:
+            self.elapsed_at_pause += (time.monotonic() - self.start_time)
+            self.is_paused = True
+        else:
+            self.start_time = time.monotonic()
+            self.is_paused = False
+
+    def advance(self):
+        if self.is_paused: return None 
+        now_val = self.get_elapsed()
+
+        if self.state != State.IDLE:
+            self.history[self.state.name] = now_val
+
+        if self.state == State.IDLE: self.state = State.LOADING
+        elif self.state == State.LOADING: self.state = State.RUNNING
+        elif self.state == State.RUNNING: self.state = State.UNLOADING
+        elif self.state == State.UNLOADING:
+            data = self._finalize_batch()
+            self.state = State.IDLE
+            return data
+        
+        self.start_time = time.monotonic()
+        self.elapsed_at_pause = 0
+        return None
+
+    def _finalize_batch(self):
+        l, r, u = self.history["LOADING"], self.history["RUNNING"], self.history["UNLOADING"]
+        total = l + r + u
+        self.grand_total_time += total
+        record = (f"{self.batch_id:03d}", f"{l:.1f}s", f"{r:.1f}s", f"{u:.1f}s", f"{total:.1f}s")
+        self.batch_id += 1
+        return record
+
+    def reset_current_batch(self):
+        self.state = State.IDLE
+        self.is_paused = False
+        self.start_time = 0
+        self.elapsed_at_pause = 0
+        self.history = {"LOADING": 0, "RUNNING": 0, "UNLOADING": 0}
+
+# --- 2. THE APPLICATION INTERFACE ---
+class BatchApp:
+    def __init__(self, root):
+        self.root = root
+        self.engine = BatchEngine()
+        self.last_input_time = 0
+        self.debounce_ms = 300 
+        
+        self.root.title("BatchTracker v2.5 - Final Production Build")
+        self.root.geometry("900x800")
+        self.root.configure(bg="#1a1a1a")
+        
+        self._build_ui()
+        
+        # Bindings
+        self.root.bind("<KeyPress-space>", self._safe_advance)
+        self.root.bind("<KeyPress-p>", self._safe_pause)
+        self.root.bind("<KeyPress-P>", self._safe_pause)
+        self.tree.bind("<Control-c>", self._copy_selection)
+        self.tree.bind("<Command-c>", self._copy_selection)
+        
+        self._tick()
+
+    def _is_debounced(self):
+        current_time = time.monotonic() * 1000 
+        if current_time - self.last_input_time > self.debounce_ms:
+            self.last_input_time = current_time
+            return True
+        return False
+
+    def _safe_advance(self, event=None):
+        if event and not self._is_debounced(): return
+        if self.engine.is_paused: return
+        
+        result = self.engine.advance()
+        if result:
+            self.tree.insert("", 0, values=result)
+            if self.auto_start.get():
+                self.engine.advance() 
+        self._update_ui_state()
+
+    def _safe_pause(self, event=None):
+        if event and not self._is_debounced(): return
+        self.engine.toggle_pause()
+        self._update_ui_state()
+
+    def _build_ui(self):
+        # Timer Display
+        self.display = tk.Frame(self.root, bg=COLORS[State.IDLE], height=220)
+        self.display.pack(fill="x", padx=10, pady=10)
+        
+        self.lbl_status = tk.Label(self.display, text="READY", font=("Arial", 32, "bold"), fg="white", bg=COLORS[State.IDLE])
+        self.lbl_status.pack(pady=(20, 0))
+        
+        self.lbl_timer = tk.Label(self.display, text="0.0", font=("Courier", 90, "bold"), fg="#00ff00", bg=COLORS[State.IDLE])
+        self.lbl_timer.pack(pady=10)
+
+        # Controls Bar
+        info_bar = tk.Frame(self.root, bg="#1a1a1a")
+        info_bar.pack(fill="x", padx=25, pady=10)
+        
+        self.lbl_batch_num = tk.Label(info_bar, text="BATCH #001", font=("Arial", 18, "bold"), fg="white", bg="#1a1a1a")
+        self.lbl_batch_num.pack(side="left")
+
+        tk.Button(info_bar, text="⏸ PAUSE (P)", command=self._safe_pause, bg="#f39c12", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=20)
+        tk.Button(info_bar, text="RESET CURRENT", command=self._reset_current, bg="#c0392b", fg="white", font=("Arial", 10, "bold")).pack(side="left")
+        
+        self.auto_start = tk.BooleanVar(value=False)
+        tk.Checkbutton(info_bar, text="Auto-Start", variable=self.auto_start, bg="#1a1a1a", fg="#888", selectcolor="#333").pack(side="right")
+
+        # Table
+        style = ttk.Style()
+        style.configure("Treeview", font=("Arial", 12), rowheight=30)
+        self.tree = ttk.Treeview(self.root, columns=(1,2,3,4,5), show="headings", height=10)
+        for i, h in enumerate(["Batch", "Load (s)", "Run (s)", "Unload (s)", "Total (s)"], 1):
+            self.tree.heading(i, text=h)
+            self.tree.column(i, anchor="center", width=120)
+        self.tree.pack(fill="both", expand=True, padx=20, pady=5)
+
+        # Footer Status
+        status_bar = tk.Frame(self.root, bg="#1a1a1a")
+        status_bar.pack(fill="x", padx=20, pady=5)
+        tk.Label(status_bar, text="Select rows + Ctrl+C to copy chronological data", font=("Arial", 10, "italic"), fg="#7f8c8d", bg="#1a1a1a").pack(side="left")
+        
+        self.lbl_grand_total = tk.Label(status_bar, text="Grand Total: 0.0s", font=("Arial", 16, "bold"), fg="#3498db", bg="#1a1a1a")
+        self.lbl_grand_total.pack(side="right")
+
+        # Export/Clear
+        btn_frame = tk.Frame(self.root, bg="#1a1a1a")
+        btn_frame.pack(fill="x", pady=10)
+        tk.Button(btn_frame, text="CLEAR HISTORY", command=self._clear_all, bg="#7f8c8d", fg="white", width=15).pack(side="left", padx=20)
+        tk.Button(btn_frame, text="EXPORT TO CSV", command=self._export, bg="#2e6da4", fg="white", width=15).pack(side="right", padx=20)
+
+    def _copy_selection(self, event=None):
+        selected_items = self.tree.selection()
+        if not selected_items: return
+        
+        # Get data and sort by Batch ID (Index 0) to fix chronological order
+        data_rows = [self.tree.item(item)["values"] for item in selected_items]
+        data_rows.sort(key=lambda x: str(x[0]))
+        
+        lines = ["\t".join(str(v) for v in row) for row in data_rows]
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        
+        # Visual confirmation
+        orig_text = self.lbl_grand_total.cget("text")
+        self.lbl_grand_total.configure(text="✓ Copied (Chronological)", fg="#2ecc71")
+        self.root.after(1500, lambda: self.lbl_grand_total.configure(text=orig_text, fg="#3498db"))
+
+    def _update_ui_state(self):
+        state, is_paused = self.engine.state, self.engine.is_paused
+        color = COLORS["PAUSED"] if is_paused else COLORS[state]
+        status_text = "PAUSED" if is_paused else (state.name if state != State.IDLE else "READY")
+        
+        self.display.configure(bg=color)
+        self.lbl_status.configure(text=status_text, bg=color)
+        self.lbl_timer.configure(bg=color)
+        self.lbl_batch_num.configure(text=f"BATCH #{self.engine.batch_id:03d}")
+        self.lbl_grand_total.configure(text=f"Grand Total: {self.engine.grand_total_time:.1f}s")
+
+    def _tick(self):
+        self.lbl_timer.configure(text=f"{self.engine.get_elapsed():.1f}")
+        self.root.after(50, self._tick)
+
+    def _reset_current(self):
+        if messagebox.askyesno("Reset", "Scrap current timers?"):
+            self.engine.reset_current_batch()
+            self._update_ui_state()
+
+    def _clear_all(self):
+        if messagebox.askyesno("Warning", "Wipe ALL history and totals?"):
+            for row in self.tree.get_children(): self.tree.delete(row)
+            self.engine.__init__()
+            self._update_ui_state()
+
+    def _export(self):
+        rows = [self.tree.item(i)["values"] for i in self.tree.get_children()]
+        try:
+            with open("batch_history.csv", "w", newline="") as f:
+                csv.writer(f).writerow(["Batch", "Load", "Run", "Unload", "Total"])
+                csv.writer(f).writerows(rows)
+            messagebox.showinfo("Done", "Saved.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BatchApp(root)
+    root.mainloop()
