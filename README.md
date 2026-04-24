@@ -1,4 +1,4 @@
-BatchTracker Pro v2.5 Guide
+Simple Job Timer
 I built this tool to streamline batch timing and keep the data organized without the headache of manual logs. It uses a hardware-precision clock to ensure we aren’t losing time to system lag or background tasks.
 
 Running the App
