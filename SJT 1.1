@@ -1,0 +1,251 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import time
+import csv
+import re
+from enum import Enum, auto
+
+class State(Enum):
+    IDLE = auto()
+    LOADING = auto()
+    RUNNING = auto()
+    UNLOADING = auto()
+
+COLORS = {
+    State.IDLE: "#2c3e50",
+    State.LOADING: "#d35400",
+    State.RUNNING: "#27ae60",
+    State.UNLOADING: "#2980b9",
+    "PAUSED": "#f1c40f"
+}
+
+class BatchEngine:
+    def __init__(self, serial_list=None):
+        self.state = State.IDLE
+        self.serial_queue = serial_list if serial_list else []
+        self.current_serial = self.serial_queue[0] if self.serial_queue else "1"
+        self.is_paused = False
+        self.start_time = 0 
+        self.elapsed_at_pause = 0
+        self.history = {"LOADING": 0, "RUNNING": 0, "UNLOADING": 0}
+
+    def get_elapsed(self):
+        if self.state == State.IDLE: return 0.0
+        if self.is_paused: return self.elapsed_at_pause
+        return self.elapsed_at_pause + (time.monotonic() - self.start_time)
+
+    def toggle_pause(self):
+        if self.state == State.IDLE: return
+        if not self.is_paused:
+            self.elapsed_at_pause += (time.monotonic() - self.start_time)
+            self.is_paused = True
+        else:
+            self.start_time = time.monotonic()
+            self.is_paused = False
+
+    def advance(self):
+        if self.is_paused: return None 
+        now_val = self.get_elapsed()
+
+        if self.state != State.IDLE:
+            self.history[self.state.name] = now_val
+
+        if self.state == State.IDLE: self.state = State.LOADING
+        elif self.state == State.LOADING: self.state = State.RUNNING
+        elif self.state == State.RUNNING: self.state = State.UNLOADING
+        elif self.state == State.UNLOADING:
+            data = self._finalize_part()
+            self.state = State.IDLE
+            return data
+        
+        self.start_time = time.monotonic()
+        self.elapsed_at_pause = 0
+        return None
+
+    def _finalize_part(self):
+        l, r, u = self.history["LOADING"], self.history["RUNNING"], self.history["UNLOADING"]
+        total = l + r + u
+        record = (str(self.current_serial), f"{l:.1f}s", f"{r:.1f}s", f"{u:.1f}s", f"{total:.1f}s")
+        
+        # Advance Queue
+        if self.serial_queue:
+            self.serial_queue.pop(0)
+            self.current_serial = self.serial_queue[0] if self.serial_queue else "COMPLETE"
+        else:
+            # Fallback to simple increment if no queue
+            try:
+                self.current_serial = str(int(self.current_serial) + 1)
+            except:
+                self.current_serial = "???"
+        
+        return record
+
+class SetupDialog:
+    def __init__(self, root):
+        self.top = tk.Toplevel(root)
+        self.top.title("Job Setup")
+        self.top.geometry("400x500")
+        self.top.configure(bg="#1a1a1a")
+        self.result = None
+        
+        tk.Label(self.top, text="Select Job Mode", font=("Arial", 14, "bold"), fg="white", bg="#1a1a1a").pack(pady=10)
+        
+        btn_frame = tk.Frame(self.top, bg="#1a1a1a")
+        btn_frame.pack(pady=10)
+        
+        tk.Button(btn_frame, text="Simple Batch (Increment)", command=self._simple_mode, width=25).pack(pady=5)
+        tk.Button(btn_frame, text="Serialized List (Paste Below)", command=self._serial_mode, width=25, bg="#27ae60", fg="white").pack(pady=5)
+        
+        tk.Label(self.top, text="Paste Serial List (Comma, Space, or Newline):", fg="gray", bg="#1a1a1a").pack(pady=(20,0))
+        self.text_area = tk.Text(self.top, height=15, width=40, bg="#333", fg="white")
+        self.text_area.pack(pady=10, padx=20)
+        
+        self.top.grab_set()
+
+    def _simple_mode(self):
+        self.result = []
+        self.top.destroy()
+
+    def _serial_mode(self):
+        raw_data = self.text_area.get("1.0", tk.END).strip()
+        if not raw_data:
+            messagebox.showwarning("Warning", "Please paste a list or select Simple Mode.")
+            return
+        # Regex split on any combination of comma, space, or newline
+        tokens = re.split(r'[,\s\n]+', raw_data)
+        self.result = [t.strip() for t in tokens if t.strip()]
+        self.top.destroy()
+
+class BatchApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.withdraw() # Hide main until setup is done
+        
+        setup = SetupDialog(self.root)
+        self.root.wait_window(setup.top)
+        
+        self.engine = BatchEngine(setup.result)
+        self.root.deiconify() # Show main window
+        
+        self.last_input_time = 0
+        self.debounce_ms = 300 
+        
+        self.root.title("BatchTracker v2.1 - Queue Manager")
+        self.root.geometry("900x850")
+        self.root.configure(bg="#1a1a1a")
+        
+        self._build_ui()
+        self._bind_keys()
+        self._tick()
+
+    def _bind_keys(self):
+        self.root.bind("<KeyPress-space>", self._safe_advance)
+        self.root.bind("<KeyPress-p>", self._safe_pause)
+        self.root.bind("<KeyPress-P>", self._safe_pause)
+        self.tree.bind("<Control-c>", self._copy_selection)
+
+    def _safe_advance(self, event=None):
+        if event and not self._is_debounced(): return
+        if self.engine.is_paused: return
+        if self.engine.current_serial == "COMPLETE":
+            messagebox.showinfo("Job Done", "All serials in queue processed.")
+            return
+
+        result = self.engine.advance()
+        if result:
+            self.tree.insert("", 0, values=result)
+            self._update_serial_display()
+            
+            if self.auto_start.get() and self.engine.current_serial != "COMPLETE":
+                self._safe_advance()
+        
+        self._update_ui_state()
+
+    def _update_serial_display(self):
+        self.lbl_serial_val.config(text=self.engine.current_serial)
+        count = len(self.engine.serial_queue)
+        self.lbl_queue_count.config(text=f"Queue Remaining: {count}")
+
+    def _safe_pause(self, event=None):
+        if event and not self._is_debounced(): return
+        self.engine.toggle_pause()
+        self._update_ui_state()
+
+    def _build_ui(self):
+        # Timer Display
+        self.display = tk.Frame(self.root, bg=COLORS[State.IDLE], height=220)
+        self.display.pack(fill="x", padx=10, pady=10)
+        
+        self.lbl_status = tk.Label(self.display, text="READY", font=("Arial", 32, "bold"), fg="white", bg=COLORS[State.IDLE])
+        self.lbl_status.pack(pady=(15, 0))
+        
+        self.lbl_timer = tk.Label(self.display, text="0.0", font=("Courier", 90, "bold"), fg="#00ff00", bg=COLORS[State.IDLE])
+        self.lbl_timer.pack(pady=5)
+
+        # Serial / Queue Bar
+        ctrl_bar = tk.Frame(self.root, bg="#1a1a1a")
+        ctrl_bar.pack(fill="x", padx=25, pady=10)
+        
+        tk.Label(ctrl_bar, text="ACTIVE SERIAL:", font=("Arial", 14, "bold"), fg="gray", bg="#1a1a1a").pack(side="left")
+        self.lbl_serial_val = tk.Label(ctrl_bar, text=self.engine.current_serial, font=("Arial", 22, "bold"), fg="white", bg="#1a1a1a")
+        self.lbl_serial_val.pack(side="left", padx=15)
+
+        self.lbl_queue_count = tk.Label(ctrl_bar, text=f"Queue Remaining: {len(self.engine.serial_queue)}", fg="#3498db", bg="#1a1a1a", font=("Arial", 10))
+        self.lbl_queue_count.pack(side="left", padx=20)
+
+        self.auto_start = tk.BooleanVar(value=False)
+        tk.Checkbutton(ctrl_bar, text="Auto-Start", variable=self.auto_start, bg="#1a1a1a", fg="#888", selectcolor="#333").pack(side="right")
+
+        # Table
+        self.tree = ttk.Treeview(self.root, columns=(1,2,3,4,5), show="headings", height=15)
+        for i, h in enumerate(["Serial #", "Load (s)", "Run (s)", "Unload (s)", "Total (s)"], 1):
+            self.tree.heading(i, text=h)
+            self.tree.column(i, anchor="center", width=120)
+        self.tree.pack(fill="both", expand=True, padx=20, pady=10)
+
+        # Bottom Buttons
+        btn_frame = tk.Frame(self.root, bg="#1a1a1a")
+        btn_frame.pack(fill="x", pady=15)
+        tk.Button(btn_frame, text="⏸ PAUSE (P)", command=self._safe_pause, bg="#f39c12", fg="white", width=12).pack(side="left", padx=20)
+        tk.Button(btn_frame, text="EXPORT CSV", command=self._export, bg="#2e6da4", fg="white", width=12).pack(side="right", padx=20)
+
+    def _is_debounced(self):
+        current_time = time.monotonic() * 1000 
+        if current_time - self.last_input_time > self.debounce_ms:
+            self.last_input_time = current_time
+            return True
+        return False
+
+    def _update_ui_state(self):
+        state, is_paused = self.engine.state, self.engine.is_paused
+        color = COLORS["PAUSED"] if is_paused else COLORS[state]
+        status_text = "PAUSED" if is_paused else (state.name if state != State.IDLE else "READY")
+        self.display.configure(bg=color)
+        self.lbl_status.configure(text=status_text, bg=color)
+        self.lbl_timer.configure(bg=color)
+
+    def _tick(self):
+        self.lbl_timer.configure(text=f"{self.engine.get_elapsed():.1f}")
+        self.root.after(50, self._tick)
+
+    def _copy_selection(self, event=None):
+        selected = self.tree.selection()
+        if not selected: return
+        rows = [self.tree.item(i)["values"] for i in selected]
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(["\t".join(str(v) for v in r) for r in rows]))
+
+    def _export(self):
+        rows = [self.tree.item(i)["values"] for i in self.tree.get_children()]
+        try:
+            with open("production_log.csv", "w", newline="") as f:
+                csv.writer(f).writerow(["Serial", "Load", "Run", "Unload", "Total"])
+                csv.writer(f).writerows(rows)
+            messagebox.showinfo("Done", "Exported to production_log.csv")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BatchApp(root)
+    root.mainloop()
